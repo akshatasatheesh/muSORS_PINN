@@ -1,4 +1,4 @@
-# Physics-Informed Meta-Learning for Depth-Selective Raman (mμSORS) Glucose Monitoring
+# Physics-Informed Neural Constraints and Meta-Learning for Robust Glucose Quantification Using Depth-Selective mμSORS Raman Spectra
 
 ## Motivation & Context
 Non-invasive glucose monitoring is clinically valuable but has struggled with accuracy and calibration needs. The mμSORS approach captures depth-selective spontaneous Raman signals from skin. In the study "Subcutaneous depth-selective spectral imaging with mμSORS enables noninvasive glucose monitoring", researchers first identified the optimal depth (at/just below the dermal–epidermal junction) in 35 individuals, then modeled 230 participants, achieving MARD 14.6% with 99.4% of results in consensus error grid (CEG) zones A+B without personalized calibration—a strong clinical demonstration. I will analyze the authors’ shared multi-offset dataset to test whether physics-informed neural netwoks (PINN) and meta-learning methods can further improve robustness and per-subject adaptation.
