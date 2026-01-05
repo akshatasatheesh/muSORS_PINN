@@ -1,11 +1,9 @@
-# Updated end-to-end PINN-style pipeline for the DIG 4 Bio Raman Transfer Learning Challenge
-# - Loads the 8 device training CSVs, interpolates to a shared wavenumber grid (300–1942 => 1643 features)
-# - Loads transfer_plate (val) and 96_samples (test) in the expected format (2 replicates averaged)
-# - Trains a physics-regularized model:
-#     spectrum ≈ c @ fingerprints + polynomial_baseline
-#   with non-negativity + smoothness constraints
-# - Uses Leave-One-Device-Out (LODO) CV on the 8 training devices
-# - Trains a final model on all training devices and writes submission.csv
+# ============================================================
+# Kaggle DIG-4-BIO Raman Transfer Learning Challenge
+# Improved v2: device-aware training, spectroscopy preprocessing,
+# 1D CNN + physics (mixture) decoder, optional CORAL alignment,
+# safer submission formatting.
+# ============================================================
 
 import os
 import numpy as np
@@ -13,21 +11,34 @@ import pandas as pd
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
+# Optional (usually available on Kaggle). If not, we fall back gracefully.
+try:
+    from scipy.signal import savgol_filter
+    HAS_SAVGOL = True
+except Exception:
+    HAS_SAVGOL = False
 
-# -------------------------
-# 0) CONFIG
-# -------------------------
+# ----------------------------
+# 0) Paths / Config
+# ----------------------------
 DATA_PATH = "/kaggle/input/dig-4-bio-raman-transfer-learning-challenge"
 
-TRAIN_DEVICE_NAMES = [
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+# Training devices (8)
+DATASET_NAMES = [
     "anton_532", "anton_785", "kaiser", "mettler_toledo",
     "metrohm", "tec5", "timegate", "tornado"
 ]
 
-# Device-specific bounds from the public notebook (intersection will be used)
+# Bounds per device (from the public notebook)
 LOWER_BOUNDS = {
     "anton_532": 200, "anton_785": 100, "kaiser": -37, "mettler_toledo": 300,
     "metrohm": 200, "tec5": 85, "timegate": 200, "tornado": 300,
@@ -37,388 +48,549 @@ UPPER_BOUNDS = {
     "metrohm": 3350, "tec5": 3210, "timegate": 2000, "tornado": 3300,
 }
 
-TARGET_COLS = ["Glucose (g/L)", "Sodium Acetate (g/L)", "Magnesium Acetate (g/L)"]
+# Global joint range (align all devices)
+JOINT_LOWER_WN = 300
+JOINT_UPPER_WN = 1942
 
-SEED = 42
-BATCH_SIZE = 64
-EPOCHS_CV = 40
-EPOCHS_FINAL = 60
-LR = 1e-3
+# ----------------------------
+# 1) Data loading (robust)
+# ----------------------------
+def get_csv_dataset(dataset_name, lower_wn=-1000, upper_wn=10000, dtype=np.float64):
+    lower_wn = max(lower_wn, LOWER_BOUNDS[dataset_name])
+    upper_wn = min(upper_wn, UPPER_BOUNDS[dataset_name])
 
-# Loss weights (tune these)
-W_RECON = 0.25
-W_SMOOTH = 0.05
-W_L1C = 1e-4
+    df = pd.read_csv(os.path.join(DATA_PATH, f"{dataset_name}.csv"))
 
-BASELINE_DEGREE = 3  # polynomial baseline degree
+    # Spectral columns are all except last 5 columns (labels + fold)
+    spectral_headers = df.columns[:-5]
+    spectral_vals = np.array([float(x) for x in spectral_headers])
 
-torch.manual_seed(SEED)
-np.random.seed(SEED)
+    spectra_selection = np.logical_and(lower_wn <= spectral_vals, spectral_vals <= upper_wn)
 
-
-# -------------------------
-# 1) TRAIN DEVICES LOADER (8 CSVs -> shared grid)
-# -------------------------
-def _safe_float_cols(cols):
-    out = []
-    for c in cols:
-        try:
-            out.append(float(c))
-        except Exception:
-            out.append(np.nan)
-    return np.array(out, dtype=np.float64)
-
-def get_device_dataset(device_name: str, lower_wn: int, upper_wn: int):
-    """
-    Reads <device_name>.csv.
-    Assumes last 5 columns are metadata/labels:
-      - last 5:-1 are labels (often 4 cols in source), last is fold index.
-    We'll keep first 3 label dims for (glucose, sodium acetate, magnesium acetate).
-    """
-    path = os.path.join(DATA_PATH, f"{device_name}.csv")
-    df = pd.read_csv(path)
-
-    # spectral columns are everything except the last 5 columns (per the public notebook)
-    spectral_df = df.iloc[:, :-5]
-    label_df = df.iloc[:, -5:-1]
+    spectra = df.iloc[:, :-5].iloc[:, spectra_selection].values
+    label = df.iloc[:, -5:-1].values         # last 5: [targets...], fold is last
     cv_indices = df.iloc[:, -1].values
 
-    wn_all = _safe_float_cols(spectral_df.columns)
-    # Filter to valid wn and within bounds
-    mask = np.isfinite(wn_all) & (wn_all >= lower_wn) & (wn_all <= upper_wn)
+    all_indices = np.arange(len(cv_indices))
+    folds = sorted(list(set(cv_indices)))
+    cv_folds = [
+        (all_indices[cv_indices != fold_idx], all_indices[cv_indices == fold_idx])
+        for fold_idx in folds
+    ]
 
-    spectra = spectral_df.loc[:, mask].values.astype(np.float64)
-    wns = wn_all[mask].astype(np.float64)
+    wavenumbers = spectral_vals[spectra_selection]
 
-    # keep first 3 targets (matches TARGET_COLS order in transfer_plate)
-    labels = label_df.values.astype(np.float64)[:, :3]
+    return (
+        spectra.astype(dtype),
+        label.astype(dtype),
+        cv_folds,
+        wavenumbers.astype(dtype),
+    )
 
-    return spectra, labels, cv_indices, wns
+def load_joint_dataset(dataset_names, lower_wn=-1000, upper_wn=10000, dtype=np.float64):
+    dtype = dtype or np.float64
 
-def load_joint_train_dataset(device_names):
-    # Shared intersection bounds so all devices can be interpolated to a common grid
-    lower_wn = max(300, *[LOWER_BOUNDS[n] for n in device_names])
-    upper_wn = min(1942, *[UPPER_BOUNDS[n] for n in device_names])
+    lower_wn = max(lower_wn, *[LOWER_BOUNDS[name] for name in dataset_names])
+    upper_wn = min(upper_wn, *[UPPER_BOUNDS[name] for name in dataset_names])
 
-    joint_wns = np.arange(lower_wn, upper_wn + 1, dtype=np.float64)  # 300..1942 => 1643
-    all_X = []
-    all_y = []
-    device_ids = []  # for LODO CV
+    # Intersect with our desired joint range
+    lower_wn = max(lower_wn, JOINT_LOWER_WN)
+    upper_wn = min(upper_wn, JOINT_UPPER_WN)
 
-    for did, name in enumerate(device_names):
-        spectra, labels, _, wns = get_device_dataset(name, lower_wn, upper_wn)
+    datasets = [
+        get_csv_dataset(name, lower_wn=lower_wn, upper_wn=upper_wn, dtype=dtype)
+        for name in dataset_names
+    ]
 
-        # Interpolate each spectrum to joint_wns
-        X_interp = np.array([np.interp(joint_wns, xp=wns, fp=row) for row in spectra], dtype=np.float64)
+    joint_wns = np.arange(lower_wn, upper_wn + 1)
 
-        # Per-spectrum normalization (more stable across devices)
-        denom = np.maximum(np.max(X_interp, axis=1, keepdims=True), 1e-12)
-        X_norm = X_interp / denom
+    # Interpolate each device spectra onto the same wavenumber grid
+    interpolated = []
+    labels = []
+    all_cv = []
+    offsets = [0]
+    for spectra, label, cv_folds, wns in datasets:
+        interp_spectra = np.array([
+            np.interp(joint_wns, xp=wns, fp=row) for row in spectra
+        ])
+        interpolated.append(interp_spectra)
+        labels.append(label[:, :3])  # first 3 targets used in the public notebook
+        all_cv.append(cv_folds)
+        offsets.append(offsets[-1] + len(interp_spectra))
 
-        all_X.append(X_norm.astype(np.float32))
-        all_y.append(labels.astype(np.float32))
-        device_ids.append(np.full((X_norm.shape[0],), did, dtype=np.int64))
+    X = np.concatenate(interpolated, axis=0)
+    y = np.concatenate(labels, axis=0)
 
-    X = np.concatenate(all_X, axis=0)
-    y = np.concatenate(all_y, axis=0)
-    device_ids = np.concatenate(device_ids, axis=0)
+    # Build combined CV folds (device-provided folds, offset-adjusted)
+    dataset_offsets = np.array(offsets[:-1], dtype=np.int64)
+    fold_val_indices = []
+    for (spectra, label, cv_folds, wns), offset in zip(datasets, dataset_offsets):
+        for tr, va in cv_folds:
+            fold_val_indices.append(va + offset)
 
-    return X, y, device_ids, joint_wns.astype(np.float32)
+    all_indices = set(range(len(X)))
+    cv_folds_joint = [
+        (np.array(list(all_indices - set(val_idx))), val_idx)
+        for val_idx in fold_val_indices
+    ]
 
+    return X.astype(np.float64), y.astype(np.float64), cv_folds_joint, joint_wns.astype(np.float64)
 
-# -------------------------
-# 2) TRANSFER/TEST LOADER (transfer_plate.csv, 96_samples.csv)
-# -------------------------
 def load_comp_data(filepath, is_train=True):
     """
-    Robust loader for transfer_plate.csv (train-like) and 96_samples.csv (headerless test-like).
-
-    transfer_plate.csv (is_train=True):
-      - has targets in TARGET_COLS
-      - spectral data is stored in many columns; sometimes includes sample_id and extra analyte columns
-    96_samples.csv (is_train=False):
-      - often header=None
-      - first column is sample_id (repeated), needs ffill
-      - spectral values may contain brackets
+    transfer_plate.csv (train=True) has headers and target columns.
+    96_samples.csv (train=False) has no header and includes sample_id rows.
     """
     if is_train:
         df = pd.read_csv(filepath)
-        # targets
-        y = df[TARGET_COLS].values.astype(np.float32)
-
-        # heuristic: spectral columns are everything except the last 4 columns in many versions
-        # but we’ll do a more robust pick:
-        # - exclude target cols
-        # - exclude obvious non-spectral cols
-        non_spec = set(TARGET_COLS)
-        for c in df.columns:
-            lc = str(c).lower()
-            if "sample" in lc or "analyte" in lc or "device" in lc:
-                non_spec.add(c)
-
-        # attempt numeric-ish columns first
-        numericish = [c for c in df.columns if c not in non_spec and str(c).replace(".", "", 1).isdigit()]
-        if len(numericish) > 1000:
-            X_df = df[numericish].copy()
-            # add synthetic sample_id
-            X_df.insert(0, "sample_id", np.arange(len(X_df)))
-        else:
-            # fallback: take everything except last 4 and targets, keep/force sample_id in first col
-            X_df = df.drop(columns=[c for c in TARGET_COLS if c in df.columns]).copy()
-            # if it already has sample_id keep it, else create it
-            if "sample_id" not in [c.lower() for c in X_df.columns]:
-                X_df.insert(0, "sample_id", np.arange(len(X_df)))
-        X = X_df
+        target_cols = ['Glucose (g/L)', 'Sodium Acetate (g/L)', 'Magnesium Acetate (g/L)']
+        y = df[target_cols].dropna().values
+        X = df.iloc[:, :-4]  # remove last 4 cols (targets + analyte info)
     else:
         df = pd.read_csv(filepath, header=None)
-        X = df.copy()
+        X = df
         y = None
-        # name columns: sample_id + spectral columns
-        X.columns = ["sample_id"] + [f"c{i}" for i in range(X.shape[1] - 1)]
 
-    # Forward-fill sample_id and clean
+    # Set column names: sample_id + spectral columns
+    X.columns = ["sample_id"] + [str(i) for i in range(X.shape[1] - 1)]
+
+    # Fill & clean sample_id
     X["sample_id"] = X["sample_id"].ffill()
-    X["sample_id"] = X["sample_id"].astype(str).str.strip()
+    if is_train:
+        X["sample_id"] = X["sample_id"].astype(str).str.strip()
+    else:
+        X["sample_id"] = X["sample_id"].astype(str).str.strip().str.replace("sample", "", regex=False).astype(int)
 
-    if not is_train:
-        # test often has 'sample###' formatting
-        X["sample_id"] = X["sample_id"].str.replace("sample", "", regex=False)
-        X["sample_id"] = pd.to_numeric(X["sample_id"], errors="coerce").fillna(method="ffill").astype(int)
-
-    # Clean spectral values (remove brackets and coerce to float)
-    spectral_cols = [c for c in X.columns if c != "sample_id"]
-    for c in spectral_cols:
-        X[c] = (
-            X[c].astype(str)
+    # Clean spectral data (remove brackets; force numeric)
+    spectral_cols = X.columns[1:]
+    for col in spectral_cols:
+        X[col] = (
+            X[col].astype(str)
             .str.replace("[", "", regex=False)
             .str.replace("]", "", regex=False)
         )
-        X[c] = pd.to_numeric(X[c], errors="coerce")
+        X[col] = pd.to_numeric(X[col], errors="coerce")
 
     return X, y
 
-def fix_val_test_shape(X_2048: np.ndarray, joint_wns: np.ndarray):
+def fix_val_test_shape(X_2x2048):
     """
-    transfer_plate and 96_samples are on a 2048-point grid from ~65..3350 (per public notebook).
-    Select 300..1942 and interpolate onto joint_wns (300..1942).
+    transfer/test files come as 2 spectra per sample at 2048 points.
+    We average the two spectra, then interpolate to joint_wns length (1643).
     """
-    lower_wns = int(joint_wns.min())
-    upper_wns = int(joint_wns.max())
+    lower_wns = JOINT_LOWER_WN
+    upper_wns = JOINT_UPPER_WN
+    joint_wns = np.arange(lower_wns, upper_wns + 1)
 
-    # native grid used in the public notebook
-    spectral_values = np.linspace(65, 3350, 2048).astype(np.float64)
-
-    mask = (spectral_values >= lower_wns) & (spectral_values <= upper_wns)
+    spectral_values = np.linspace(65, 3350, 2048)  # as in public notebook
+    mask = np.logical_and(lower_wns <= spectral_values, spectral_values <= upper_wns)
     wns = spectral_values[mask]
-    X_sel = X_2048[:, mask].astype(np.float64)
 
-    X_interp = np.array([np.interp(joint_wns.astype(np.float64), xp=wns, fp=row) for row in X_sel], dtype=np.float64)
+    X = X_2x2048[:, mask]
+    X = np.array([np.interp(joint_wns, xp=wns, fp=row) for row in X])
+    return X
 
-    # per-spectrum normalization (match train)
-    denom = np.maximum(np.max(X_interp, axis=1, keepdims=True), 1e-12)
-    X_norm = (X_interp / denom).astype(np.float32)
-    return X_norm
+# ----------------------------
+# 2) Spectroscopy preprocessing
+# ----------------------------
+def preprocess_spectra(X, use_savgol=True, deriv_order=1, snv=True):
+    """
+    X: (N, L) float array
+    - SavGol smooth
+    - Derivative (1st)
+    - SNV per spectrum (mean 0, std 1)
+    """
+    Xp = X.copy()
 
+    if use_savgol and HAS_SAVGOL:
+        # window length must be odd and <= L
+        L = Xp.shape[1]
+        win = min(31, L - (1 - L % 2))  # keep odd
+        if win < 7:
+            win = 7 if L >= 7 else (L // 2 * 2 + 1)
+        poly = 3 if win >= 7 else 2
+        Xp = savgol_filter(Xp, window_length=win, polyorder=poly, axis=1)
 
-# -------------------------
-# 3) PINN-ish MODEL: c >= 0, fingerprints >= 0, smooth fingerprints, polynomial baseline
-# -------------------------
-class RamanPINN(nn.Module):
-    def __init__(self, input_dim: int, num_components: int = 3, baseline_degree: int = 3):
+    if deriv_order == 1:
+        Xp = np.gradient(Xp, axis=1)
+    elif deriv_order == 2:
+        Xp = np.gradient(np.gradient(Xp, axis=1), axis=1)
+
+    if snv:
+        mu = Xp.mean(axis=1, keepdims=True)
+        sd = Xp.std(axis=1, keepdims=True) + 1e-8
+        Xp = (Xp - mu) / sd
+
+    return Xp
+
+# ----------------------------
+# 3) Model: 1D CNN encoder + physics mixing decoder
+# ----------------------------
+class CNNMixPINN(nn.Module):
+    """
+    Encoder predicts concentrations (3).
+    Decoder reconstructs spectra as: c @ fingerprints + smooth baseline
+    """
+    def __init__(self, L, wns, num_components=3, emb_dim=128, baseline_degree=3):
         super().__init__()
-        self.input_dim = input_dim
+        self.L = L
         self.num_components = num_components
-        self.baseline_degree = baseline_degree
 
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 512),
+        # Normalize wavenumbers for baseline polynomial
+        wns = torch.tensor(wns, dtype=torch.float32)
+        wns_norm = (wns - wns.mean()) / (wns.std() + 1e-8)
+        self.register_buffer("wns_norm", wns_norm)
+
+        # 1D CNN encoder
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=9, padding=4),
             nn.ReLU(),
-            nn.Dropout(0.15),
-            nn.Linear(512, 256),
+            nn.Conv1d(32, 64, kernel_size=9, padding=4),
             nn.ReLU(),
-            nn.Linear(256, num_components),
+            nn.MaxPool1d(2),
+            nn.Conv1d(64, 128, kernel_size=7, padding=3),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
         )
-        self.softplus = nn.Softplus()
 
-        # raw parameters -> softplus to enforce non-negativity
-        self.fps_raw = nn.Parameter(torch.randn(num_components, input_dim) * 0.02)
+        # compute conv output size
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, L)
+            out = self.conv(dummy)
+            flat_dim = out.view(1, -1).shape[1]
 
-        # Polynomial baseline basis (fixed), coefficients learned
-        x = torch.linspace(-1.0, 1.0, input_dim).unsqueeze(1)  # (D,1)
-        basis = [torch.ones_like(x)]
-        for d in range(1, baseline_degree + 1):
-            basis.append(x ** d)
-        B = torch.cat(basis, dim=1)  # (D, deg+1)
-        self.register_buffer("baseline_basis", B)  # not trainable
-        self.baseline_coeff = nn.Parameter(torch.zeros(baseline_degree + 1))  # (deg+1,)
+        self.fc = nn.Sequential(
+            nn.Linear(flat_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, emb_dim),
+            nn.ReLU(),
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(emb_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_components),
+            nn.Softplus(),  # nonnegative concentrations
+        )
+
+        # Fingerprints: parameterize as softplus(raw) to ensure nonnegative
+        self.raw_fingerprints = nn.Parameter(torch.randn(num_components, L) * 0.01)
+
+        # Smooth baseline polynomial coefficients
+        # baseline(x) = sum_{k=0..d} a_k * (wn_norm^k)
+        self.baseline_degree = baseline_degree
+        self.baseline_coeff = nn.Parameter(torch.zeros(baseline_degree + 1))
+
+    def encode(self, x):
+        # x: (B, L)
+        z = self.conv(x.unsqueeze(1))
+        z = z.view(z.size(0), -1)
+        emb = self.fc(z)
+        c = self.head(emb)
+        return c, emb
+
+    def decode(self, c):
+        # c: (B, C)
+        fingerprints = F.softplus(self.raw_fingerprints)  # (C, L), nonnegative
+        recon = c @ fingerprints  # (B, L)
+
+        # baseline vector (L,)
+        powers = torch.stack([self.wns_norm ** k for k in range(self.baseline_degree + 1)], dim=0)  # (d+1, L)
+        baseline = (self.baseline_coeff.view(-1, 1) * powers).sum(dim=0)  # (L,)
+        recon = recon + baseline.unsqueeze(0)
+        return recon
 
     def forward(self, x):
-        # concentrations
-        c = self.softplus(self.encoder(x))  # (N,3) non-negative
+        c, emb = self.encode(x)
+        recon = self.decode(c)
+        return c, recon, emb
 
-        # fingerprints
-        fps = self.softplus(self.fps_raw)   # (3,D) non-negative
+# ----------------------------
+# 4) Loss helpers (smoothness + CORAL)
+# ----------------------------
+def second_derivative_smoothness(fp):
+    # fp: (C, L)
+    d2 = fp[:, 2:] - 2 * fp[:, 1:-1] + fp[:, :-2]
+    return torch.mean(d2 ** 2)
 
-        # baseline
-        baseline = (self.baseline_basis @ self.baseline_coeff).unsqueeze(0)  # (1,D)
+def coral_loss(source, target):
+    """
+    CORAL loss between feature covariances.
+    source/target: (B, D)
+    """
+    def cov(x):
+        x = x - x.mean(dim=0, keepdim=True)
+        return (x.t() @ x) / (x.size(0) - 1 + 1e-8)
 
-        # reconstruction
-        y_hat = c @ fps + baseline  # (N,D)
-        return c, y_hat, fps
+    Cs = cov(source)
+    Ct = cov(target)
+    return torch.mean((Cs - Ct) ** 2)
 
-
-# -------------------------
-# 4) TRAINING / EVAL
-# -------------------------
-def rmse(pred, target):
-    return torch.sqrt(torch.mean((pred - target) ** 2))
-
-def train_one_epoch(model, loader, optimizer, device):
-    model.train()
-    mse = nn.MSELoss()
-
-    total = 0.0
-    for Xb, yb in loader:
-        Xb = Xb.to(device)
-        yb = yb.to(device)
-
-        optimizer.zero_grad()
-
-        c_pred, x_recon, fps = model(Xb)
-
-        loss_conc = mse(c_pred, yb)
-        loss_recon = mse(x_recon, Xb)
-
-        # smoothness: second-difference penalty (encourages smooth fingerprints)
-        d1 = fps[:, 1:] - fps[:, :-1]
-        d2 = d1[:, 1:] - d1[:, :-1]
-        loss_smooth = torch.mean(d2 ** 2)
-
-        # sparse-ish concentrations
-        loss_l1c = torch.mean(torch.abs(c_pred))
-
-        loss = loss_conc + W_RECON * loss_recon + W_SMOOTH * loss_smooth + W_L1C * loss_l1c
-        loss.backward()
-        optimizer.step()
-
-        total += loss.item() * Xb.size(0)
-
-    return total / len(loader.dataset)
-
+# ----------------------------
+# 5) Train / Eval
+# ----------------------------
 @torch.no_grad()
-def eval_model(model, X, y, device):
+def eval_rmse(model, X, y, batch_size=256):
     model.eval()
-    X = X.to(device)
-    y = y.to(device)
-    c_pred, _, _ = model(X)
-    return rmse(c_pred, y).item()
+    ds = TensorDataset(X, y)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
-def lodo_splits(device_ids: np.ndarray):
-    uniq = np.unique(device_ids)
-    for did in uniq:
-        val_idx = np.where(device_ids == did)[0]
-        train_idx = np.where(device_ids != did)[0]
-        yield did, train_idx, val_idx
+    se = 0.0
+    n = 0
+    for xb, yb in dl:
+        xb = xb.to(DEVICE)
+        yb = yb.to(DEVICE)
+        pred_c, _, _ = model(xb)
+        se += torch.sum((pred_c - yb) ** 2).item()
+        n += yb.numel()
+    mse = se / max(n, 1)
+    return float(np.sqrt(mse))
 
+def train_one_fold(
+    X_train, y_train,
+    X_val, y_val,
+    wns,
+    epochs=30,
+    batch_size=64,
+    lr=2e-3,
+    wd=1e-4,
+    w_recon=0.3,
+    w_smooth=0.05,
+    w_fp_l1=1e-5,
+    w_coral=0.0,
+    X_target_for_coral=None,
+    patience=6,
+):
+    L = X_train.shape[1]
+    model = CNNMixPINN(L=L, wns=wns, num_components=3).to(DEVICE)
 
-# -------------------------
-# 5) MAIN PIPELINE
-# -------------------------
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    loss_conc_fn = nn.SmoothL1Loss()  # robust
+    loss_recon_fn = nn.MSELoss()
+
+    train_dl = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True, drop_last=True)
+
+    target_dl = None
+    if w_coral > 0 and X_target_for_coral is not None:
+        target_dl = DataLoader(TensorDataset(X_target_for_coral), batch_size=batch_size, shuffle=True, drop_last=True)
+        target_it = iter(target_dl)
+
+    best = {"rmse": 1e9, "state": None}
+    bad = 0
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        for (xb, yb) in train_dl:
+            xb = xb.to(DEVICE)
+            yb = yb.to(DEVICE)
+
+            opt.zero_grad()
+            pred_c, recon, emb_s = model(xb)
+
+            # Losses
+            loss_conc = loss_conc_fn(pred_c, yb)
+            loss_recon = loss_recon_fn(recon, xb)
+
+            fp = F.softplus(model.raw_fingerprints)
+            loss_smooth = second_derivative_smoothness(fp)
+            loss_l1 = torch.mean(torch.abs(fp))
+
+            loss = loss_conc + (w_recon * loss_recon) + (w_smooth * loss_smooth) + (w_fp_l1 * loss_l1)
+
+            # Optional CORAL alignment to transfer device spectra
+            if target_dl is not None:
+                try:
+                    (xt,) = next(target_it)
+                except StopIteration:
+                    target_it = iter(target_dl)
+                    (xt,) = next(target_it)
+                xt = xt.to(DEVICE)
+                _, _, emb_t = model(xt)
+                loss = loss + w_coral * coral_loss(emb_s, emb_t)
+
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+
+        val_rmse = eval_rmse(model, X_val, y_val)
+        print(f"Epoch {ep:02d} | val RMSE: {val_rmse:.5f}")
+
+        if val_rmse < best["rmse"] - 1e-5:
+            best["rmse"] = val_rmse
+            best["state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+            if bad >= patience:
+                print(f"Early stopping at epoch {ep}. Best RMSE={best['rmse']:.5f}")
+                break
+
+    if best["state"] is not None:
+        model.load_state_dict(best["state"])
+    return model, best["rmse"]
+
+def fit_full_then_finetune(
+    X_train, y_train, wns,
+    X_transfer, y_transfer,
+    epochs_pre=40,
+    epochs_ft=15,
+):
+    # Pretrain using a simple split (small holdout from train for stability)
+    n = X_train.shape[0]
+    idx = np.arange(n)
+    np.random.shuffle(idx)
+    cut = int(0.9 * n)
+    tr, va = idx[:cut], idx[cut:]
+
+    model, rmse = train_one_fold(
+        X_train[tr], y_train[tr],
+        X_train[va], y_train[va],
+        wns=wns,
+        epochs=epochs_pre,
+        batch_size=64,
+        lr=2e-3,
+        wd=1e-4,
+        w_recon=0.3,
+        w_smooth=0.05,
+        w_fp_l1=1e-5,
+        # Use CORAL to nudge embeddings toward transfer device
+        w_coral=0.05,
+        X_target_for_coral=X_transfer,
+        patience=8,
+    )
+    print("Pretrain RMSE (holdout):", rmse)
+
+    # Fine-tune on transfer_plate labels (lower LR)
+    model.train()
+    opt = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
+    loss_fn = nn.SmoothL1Loss()
+    dl = DataLoader(TensorDataset(X_transfer, y_transfer), batch_size=32, shuffle=True)
+
+    for ep in range(1, epochs_ft + 1):
+        for xb, yb in dl:
+            xb = xb.to(DEVICE)
+            yb = yb.to(DEVICE)
+            opt.zero_grad()
+            pred_c, recon, _ = model(xb)
+
+            # fine-tune mainly on concentration accuracy; keep some recon regularization
+            loss = loss_fn(pred_c, yb) + 0.15 * F.mse_loss(recon, xb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+
+        ft_rmse = eval_rmse(model, X_transfer, y_transfer)
+        print(f"FineTune Epoch {ep:02d} | transfer RMSE: {ft_rmse:.5f}")
+
+    return model
+
+# ----------------------------
+# 6) Main: load, preprocess, train, predict, submit
+# ----------------------------
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
+    print("Using device:", DEVICE)
 
-    # Load joint training set (8 devices)
-    X_train_np, y_train_np, dev_ids, joint_wns = load_joint_train_dataset(TRAIN_DEVICE_NAMES)
-    print("Train joint shape:", X_train_np.shape, y_train_np.shape, "features:", len(joint_wns))
+    # A) Load joint device training set
+    X_train_raw, y_train_raw, cv_folds, joint_wns = load_joint_dataset(DATASET_NAMES)
+    print("Train (raw):", X_train_raw.shape, y_train_raw.shape)
 
-    # Load transfer val + test
-    X_val_raw, y_val_np = load_comp_data(os.path.join(DATA_PATH, "transfer_plate.csv"), is_train=True)
-    X_test_raw, _ = load_comp_data(os.path.join(DATA_PATH, "96_samples.csv"), is_train=False)
+    # B) Load transfer_plate (labeled) + test (unlabeled)
+    X_val_raw_df, y_val = load_comp_data(os.path.join(DATA_PATH, "transfer_plate.csv"), is_train=True)
+    X_test_raw_df, _ = load_comp_data(os.path.join(DATA_PATH, "96_samples.csv"), is_train=False)
 
-    # Drop sample_id, reshape into (N,2,2048) and average replicates
-    X_val_2048 = X_val_raw.drop(columns=["sample_id"]).values.reshape(-1, 2, 2048).mean(axis=1).astype(np.float32)
-    X_test_2048 = X_test_raw.drop(columns=["sample_id"]).values.reshape(-1, 2, 2048).mean(axis=1).astype(np.float32)
+    # Average the two spectra per sample (reshape: -1, 2, 2048)
+    X_val_2x2048 = X_val_raw_df.drop("sample_id", axis=1).values.reshape(-1, 2, 2048).mean(axis=1)
+    X_test_2x2048 = X_test_raw_df.drop("sample_id", axis=1).values.reshape(-1, 2, 2048).mean(axis=1)
 
-    # Interpolate to joint_wns, normalize per spectrum
-    X_val_np = fix_val_test_shape(X_val_2048, joint_wns.numpy())
-    X_test_np = fix_val_test_shape(X_test_2048, joint_wns.numpy())
+    # Fix shape to (N, 1643)
+    X_val_raw = fix_val_test_shape(X_val_2x2048)
+    X_test_raw = fix_val_test_shape(X_test_2x2048)
 
-    print("Transfer val shape:", X_val_np.shape, y_val_np.shape)
-    print("Test shape:", X_test_np.shape)
+    print("Transfer/test (raw):", X_val_raw.shape, X_test_raw.shape)
 
-    # Torch tensors
-    X_train = torch.tensor(X_train_np, dtype=torch.float32)
-    y_train = torch.tensor(y_train_np, dtype=torch.float32)
-    X_val = torch.tensor(X_val_np, dtype=torch.float32)
-    y_val = torch.tensor(y_val_np, dtype=torch.float32)
-    X_test = torch.tensor(X_test_np, dtype=torch.float32)
+    # C) Preprocess spectra (recommended)
+    X_train = preprocess_spectra(X_train_raw, use_savgol=True, deriv_order=1, snv=True).astype(np.float32)
+    X_val = preprocess_spectra(X_val_raw, use_savgol=True, deriv_order=1, snv=True).astype(np.float32)
+    X_test = preprocess_spectra(X_test_raw, use_savgol=True, deriv_order=1, snv=True).astype(np.float32)
 
-    # -------------------------
-    # LODO CV on train devices
-    # -------------------------
-    cv_scores = []
-    for did, tr_idx, va_idx in lodo_splits(dev_ids):
-        model = RamanPINN(input_dim=X_train.shape[1], num_components=3, baseline_degree=BASELINE_DEGREE).to(device)
-        opt = optim.Adam(model.parameters(), lr=LR)
+    # D) Scale targets (helps stability) using train stats
+    y_train = y_train_raw.astype(np.float32)
+    y_val = y_val.astype(np.float32)
 
-        train_loader = DataLoader(
-            TensorDataset(X_train[tr_idx], y_train[tr_idx]),
-            batch_size=BATCH_SIZE, shuffle=True, drop_last=False
+    y_mu = y_train.mean(axis=0, keepdims=True)
+    y_sd = y_train.std(axis=0, keepdims=True) + 1e-8
+    y_train_s = (y_train - y_mu) / y_sd
+    y_val_s = (y_val - y_mu) / y_sd
+
+    # E) Torch tensors
+    X_train_t = torch.tensor(X_train, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train_s, dtype=torch.float32)
+    X_val_t = torch.tensor(X_val, dtype=torch.float32)
+    y_val_t = torch.tensor(y_val_s, dtype=torch.float32)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32)
+
+    # F) Quick CV on the device-based folds (optional but recommended)
+    # This can be slower; comment out if you only want full+finetune.
+    print("\n=== Device-based CV (quick check) ===")
+    cv_rmse = []
+    for i, (tr_idx, va_idx) in enumerate(cv_folds[:5]):  # limit to first 5 folds for speed
+        model, rmse = train_one_fold(
+            X_train_t[tr_idx], y_train_t[tr_idx],
+            X_train_t[va_idx], y_train_t[va_idx],
+            wns=joint_wns,
+            epochs=20,
+            batch_size=64,
+            lr=2e-3,
+            wd=1e-4,
+            w_recon=0.3,
+            w_smooth=0.05,
+            w_fp_l1=1e-5,
+            w_coral=0.02,
+            X_target_for_coral=X_val_t,  # align to transfer device
+            patience=5,
         )
+        print(f"Fold {i+1} RMSE (scaled targets): {rmse:.5f}")
+        cv_rmse.append(rmse)
 
-        for ep in range(EPOCHS_CV):
-            loss = train_one_epoch(model, train_loader, opt, device)
+    if cv_rmse:
+        print("Mean CV RMSE (scaled):", float(np.mean(cv_rmse)))
 
-        score = eval_model(model, X_train[va_idx], y_train[va_idx], device)
-        cv_scores.append(score)
-        print(f"LODO device={TRAIN_DEVICE_NAMES[did]} RMSE={score:.4f}")
-
-    print("LODO CV mean RMSE:", float(np.mean(cv_scores)), "std:", float(np.std(cv_scores)))
-
-    # -------------------------
-    # Train FINAL model on all 8 devices
-    # (You can early-stop using transfer_plate RMSE if desired)
-    # -------------------------
-    final_model = RamanPINN(input_dim=X_train.shape[1], num_components=3, baseline_degree=BASELINE_DEGREE).to(device)
-    final_opt = optim.Adam(final_model.parameters(), lr=LR)
-
-    full_loader = DataLoader(
-        TensorDataset(X_train, y_train),
-        batch_size=BATCH_SIZE, shuffle=True, drop_last=False
+    # G) Train full model + fine-tune on transfer_plate
+    print("\n=== Full train + fine-tune on transfer_plate ===")
+    model = fit_full_then_finetune(
+        X_train_t, y_train_t, joint_wns,
+        X_val_t, y_val_t,
+        epochs_pre=45,
+        epochs_ft=15,
     )
+    model.eval()
 
-    best_val = 1e9
-    best_state = None
-
-    for ep in range(EPOCHS_FINAL):
-        loss = train_one_epoch(final_model, full_loader, final_opt, device)
-        val_score = eval_model(final_model, X_val, y_val, device)
-        if val_score < best_val:
-            best_val = val_score
-            best_state = {k: v.detach().cpu().clone() for k, v in final_model.state_dict().items()}
-        if (ep + 1) % 10 == 0 or ep == 0:
-            print(f"[Final] epoch={ep+1:03d} loss={loss:.5f} transfer_RMSE={val_score:.4f}")
-
-    print("Best transfer_plate RMSE:", best_val)
-    if best_state is not None:
-        final_model.load_state_dict(best_state)
-
-    # -------------------------
-    # Predict TEST and write submission
-    # -------------------------
-    final_model.eval()
+    # H) Predict on test, unscale targets
     with torch.no_grad():
-        c_test, _, _ = final_model(X_test.to(device))
-        c_test = c_test.cpu().numpy()
+        pred_s, _, _ = model(X_test_t.to(DEVICE))
+        pred_s = pred_s.cpu().numpy()
+    pred = pred_s * y_sd + y_mu  # back to original units
 
-    submission = pd.DataFrame(
-        c_test,
-        columns=TARGET_COLS  # Kaggle expects these 3 targets
-    )
-    submission.to_csv("submission.csv", index=False)
-    print("Wrote submission.csv with shape:", submission.shape)
+    # I) Build submission (try to match sample_submission if present)
+    sample_sub_path = os.path.join(DATA_PATH, "sample_submission.csv")
+    if os.path.exists(sample_sub_path):
+        sub = pd.read_csv(sample_sub_path)
+        # Attempt to fill by known target columns
+        target_cols = ['Glucose (g/L)', 'Sodium Acetate (g/L)', 'Magnesium Acetate (g/L)']
+        for j, col in enumerate(target_cols):
+            if col in sub.columns:
+                sub[col] = pred[:, j]
+        sub.to_csv("submission.csv", index=False)
+    else:
+        # Fallback: just output the 3 target columns
+        sub = pd.DataFrame(
+            pred,
+            columns=['Glucose (g/L)', 'Sodium Acetate (g/L)', 'Magnesium Acetate (g/L)']
+        )
+        sub.to_csv("submission.csv", index=False)
 
+    print("\nWrote: submission.csv")
 
 if __name__ == "__main__":
     main()
