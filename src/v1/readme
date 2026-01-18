@@ -1,1 +1,21 @@
-First version
+Sample Output of v1 
+.venv) satheeshjoseph@satheeshs-mbp src % python train_vanilla_nn.py \
+  --data_dir "/Users/satheeshjoseph/anvilogicinsights/tuning/tuning_recommendations/src/tuning_recommendations/app/feedback/raman_light/data/dig-4-bio-raman-transfer-learning-challenge" \
+  --out_dir ./outputs \
+  --epochs 60 --batch_size 64 --lr 1e-3 
+Using device: cpu
+Shared grid: 300.0 .. 1941.0 len= 1642
+Train: (2261, 1642) (2261, 3)
+Val  : (96, 1642) (96, 3)
+Test : (96, 1642)
+epoch=001 train_mse=5.942385 val_rmse=2.4364 val_r2=[-5.751, -4.045, -2.629]
+epoch=010 train_mse=5.402451 val_rmse=2.3046 val_r2=[-4.961, -4.011, -3.092]
+epoch=020 train_mse=4.943134 val_rmse=2.2449 val_r2=[-4.779, -3.580, -0.354]
+epoch=030 train_mse=4.880298 val_rmse=2.1088 val_r2=[-3.386, -4.347, -14.299]
+epoch=040 train_mse=4.471944 val_rmse=1.6546 val_r2=[-1.273, -3.806, -15.387]
+epoch=050 train_mse=4.530172 val_rmse=1.3781 val_r2=[-0.806, -4.399, -0.807]
+epoch=060 train_mse=4.181932 val_rmse=3.5503 val_r2=[-13.758, -5.338, -5.614]
+Best val RMSE: 1.1131858383251123
+Saved model: ./outputs/model.pt
+Wrote: ./outputs/submission.csv shape= (96, 4)
+(.venv) satheeshjoseph@satheeshs-mbp src % 
