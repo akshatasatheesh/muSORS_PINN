@@ -51,3 +51,32 @@ python train_vanilla_nn_v2.py --data_dir "/Users/satheeshjoseph/Akshata/raman_li
 Outputs:
 - `./<out_dir>/model.pt`
 - `./<out_dir>/submission.csv`
+
+SAMPLE RUN
+```bash
+(.venv) satheeshjoseph@satheeshs-mbp raman_v2_2 % python train_vanilla_nn_v2.py --data_dir "/Users/satheeshjoseph/Akshata/raman_light/data/dig-4-bio-raman-transfer-learning-challenge" --out_dir ./outputs_v2_2 --epochs 150 --batch_size 64 --lr 3e-4 --use_msc --baseline poly --baseline_degree 3 --use_savgol --savgol_window 11 --savgol_polyorder 3 --scaling standard --non_negative 0 
+Using device: cpu
+Shared grid: 300.0 .. 1942.0 len= 1643
+Train: (2261, 1643) (2261, 3) devices: 8
+Val: (96, 1643) (96, 3)
+Test: (96, 1643)
+Preprocess: PreprocessConfig(use_msc=True, baseline='poly', baseline_degree=3, snip_max_half_window=20, snip_smooth_half_window=3, use_savgol=True, savgol_window=11, savgol_polyorder=3, savgol_deriv=0, scaling='standard')
+Target weights: [0.05443924 2.4882488  0.45731193]
+epoch=001 train_mse=0.841532 inv_mse=0.000000 val_rmse=2.9932 val_r2=[-2.084, -0.529, -0.208]
+epoch=010 train_mse=0.263276 inv_mse=0.000000 val_rmse=1.8076 val_r2=[0.002, -1.393, -0.600]
+epoch=020 train_mse=0.147127 inv_mse=0.000000 val_rmse=1.8746 val_r2=[-0.108, -1.483, -0.120]
+epoch=030 train_mse=0.113853 inv_mse=0.000000 val_rmse=2.1918 val_r2=[-0.520, -2.401, -0.435]
+Early stopping at epoch 35 (patience=20).
+Best val RMSE: 1.788697717783597
+Saved model: ./outputs_v2_2/model.pt
+Wrote: ./outputs_v2_2/submission.csv shape= (96, 4)
+              ID    Glucose  Sodium Acetate  Magnesium Sulfate
+count  96.000000  96.000000       96.000000          96.000000
+mean   48.500000   6.495628        0.614819           1.063587
+std    27.856777   0.111445        0.158401           0.087874
+min     1.000000   6.202198        0.381955           0.912840
+25%    24.750000   6.415316        0.490281           0.994892
+50%    48.500000   6.504153        0.571689           1.039753
+75%    72.250000   6.591155        0.737336           1.138701
+max    96.000000   6.679750        0.996660           1.290842
+```
