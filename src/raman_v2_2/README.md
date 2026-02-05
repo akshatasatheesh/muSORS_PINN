@@ -54,7 +54,7 @@ Outputs:
 
 SAMPLE RUN
 ```bash
-(.venv) satheeshjoseph@satheeshs-mbp raman_v2_2 % python train_vanilla_nn_v2.py --data_dir "/Users/satheeshjoseph/Akshata/raman_light/data/dig-4-bio-raman-transfer-learning-challenge" --out_dir ./outputs_v2_2 --epochs 150 --batch_size 64 --lr 3e-4 --use_msc --baseline poly --baseline_degree 3 --use_savgol --savgol_window 11 --savgol_polyorder 3 --scaling standard --non_negative 0 
+(.venv) akshata@akshata-mbp raman_v2_2 % python train_vanilla_nn_v2.py --data_dir "/Users/satheeshjoseph/Akshata/raman_light/data/dig-4-bio-raman-transfer-learning-challenge" --out_dir ./outputs_v2_2 --epochs 150 --batch_size 64 --lr 3e-4 --use_msc --baseline poly --baseline_degree 3 --use_savgol --savgol_window 11 --savgol_polyorder 3 --scaling standard --non_negative 0 
 Using device: cpu
 Shared grid: 300.0 .. 1942.0 len= 1643
 Train: (2261, 1643) (2261, 3) devices: 8
