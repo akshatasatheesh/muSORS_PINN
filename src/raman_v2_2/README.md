@@ -80,3 +80,8 @@ min     1.000000   6.202198        0.381955           0.912840
 75%    72.250000   6.591155        0.737336           1.138701
 max    96.000000   6.679750        0.996660           1.290842
 ```
+
+My laptop run
+```bash
+python src/raman_v2_2/train_vanilla_nn_v2.py --data_dir "/Users/akshatasatheeshkumar/Desktop/Github/muSORS_PINN/data/kaggle/dig-4-bio-raman" --out_dir .src/raman_v2_2/outputs_v2_2 --epochs 150 --batch_size 64 --lr 3e-4 --use_msc --baseline poly --baseline_degree 3 --use_savgol --savgol_window 11 --savgol_polyorder 3 --scaling standard --non_negative 0
+```
